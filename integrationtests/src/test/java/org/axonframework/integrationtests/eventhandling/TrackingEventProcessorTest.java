@@ -45,8 +45,11 @@ import org.axonframework.messaging.StreamableMessageSource;
 import org.axonframework.messaging.unitofwork.CurrentUnitOfWork;
 import org.axonframework.serialization.SerializationException;
 import org.hamcrest.CoreMatchers;
-import org.junit.jupiter.api.*;
-import org.mockito.*;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+import org.mockito.InOrder;
 import org.springframework.test.annotation.DirtiesContext;
 
 import java.util.ArrayList;
@@ -81,8 +84,30 @@ import static org.axonframework.integrationtests.utils.AssertUtils.assertWithin;
 import static org.axonframework.integrationtests.utils.EventTestUtils.createEvent;
 import static org.axonframework.integrationtests.utils.EventTestUtils.createEvents;
 import static org.hamcrest.MatcherAssert.assertThat;
-import static org.junit.jupiter.api.Assertions.*;
-import static org.mockito.Mockito.*;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
+import static org.mockito.Mockito.any;
+import static org.mockito.Mockito.anyInt;
+import static org.mockito.Mockito.anyString;
+import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.eq;
+import static org.mockito.Mockito.inOrder;
+import static org.mockito.Mockito.isNull;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 /**
  * Test class validating the {@link TrackingEventProcessor}.
@@ -267,12 +292,13 @@ class TrackingEventProcessorTest {
             }
             return null;
         }).when(mockHandler).handle(any());
-        testSubject.start();
+        int segmentId = 0;
 
+        testSubject.start();
         eventBus.publish(createEvents(2));
 
         assertWithin(2, TimeUnit.SECONDS, () -> {
-            EventTrackerStatus status = testSubject.processingStatus().get(0);
+            EventTrackerStatus status = testSubject.processingStatus().get(segmentId);
             assertNotNull(status);
             assertTrue(status.isErrorState());
             assertEquals(MockException.class, status.getError().getClass());
@@ -281,7 +307,7 @@ class TrackingEventProcessorTest {
         errorFlag.set(false);
 
         assertWithin(5, TimeUnit.SECONDS, () -> {
-            EventTrackerStatus status = testSubject.processingStatus().get(0);
+            EventTrackerStatus status = testSubject.processingStatus().get(segmentId);
             assertNotNull(status);
             assertFalse(status.isErrorState());
             assertNull(status.getError());
@@ -400,7 +426,7 @@ class TrackingEventProcessorTest {
     }
 
     @Test
-    void testTokenStoredAtEndOfEventBatchAndNotExtended() throws Exception {
+    void testTokenStoredAtEndOfEventBatchAndNotExtendedWhenUsingANoTransactionManager() throws Exception {
         TrackingEventProcessorConfiguration tepConfig =
                 TrackingEventProcessorConfiguration.forSingleThreadedProcessing().andBatchSize(100);
         testSubject = TrackingEventProcessor.builder()
@@ -410,6 +436,48 @@ class TrackingEventProcessorTest {
                                             .messageSource(eventBus)
                                             .tokenStore(tokenStore)
                                             .transactionManager(NoTransactionManager.INSTANCE)
+                                            .build();
+
+        CountDownLatch countDownLatch = new CountDownLatch(2);
+        AtomicInteger invocationsInUnitOfWork = new AtomicInteger();
+        doAnswer(i -> {
+            if (CurrentUnitOfWork.isStarted()) {
+                invocationsInUnitOfWork.incrementAndGet();
+            }
+            return i.callRealMethod();
+        }).when(tokenStore).extendClaim(anyString(), anyInt());
+
+        testSubject.registerHandlerInterceptor(((unitOfWork, interceptorChain) -> {
+            unitOfWork.onCleanup(uow -> countDownLatch.countDown());
+            return interceptorChain.proceed();
+        }));
+        testSubject.start();
+        eventBus.publish(createEvents(2));
+        assertTrue(
+                countDownLatch.await(5, TimeUnit.SECONDS),
+                "Expected Unit of Work to have reached clean up phase for 2 messages"
+        );
+
+        verify(tokenStore, times(1)).storeToken(any(), any(), anyInt());
+        assertNotNull(tokenStore.fetchToken(testSubject.getName(), 0));
+
+        assertEquals(
+                1, invocationsInUnitOfWork.get(),
+                "Unexpected number of invocations of token extension in unit of work"
+        );
+    }
+
+    @Test
+    void testTokenStoredAtEndOfEventBatchAndNotExtendedWhenTransactionManagerIsConfigured() throws Exception {
+        TrackingEventProcessorConfiguration tepConfig =
+                TrackingEventProcessorConfiguration.forSingleThreadedProcessing().andBatchSize(100);
+        testSubject = TrackingEventProcessor.builder()
+                                            .name("test")
+                                            .eventHandlerInvoker(eventHandlerInvoker)
+                                            .trackingEventProcessorConfiguration(tepConfig)
+                                            .messageSource(eventBus)
+                                            .tokenStore(tokenStore)
+                                            .transactionManager(() -> mock(Transaction.class))
                                             .build();
 
         CountDownLatch countDownLatch = new CountDownLatch(2);
@@ -677,14 +745,15 @@ class TrackingEventProcessorTest {
         when(mockHandler.supportsReset()).thenReturn(true);
         final List<String> handled = new CopyOnWriteArrayList<>();
         final List<String> handledInRedelivery = new CopyOnWriteArrayList<>();
+        int segmentId = 0;
 
         //noinspection Duplicates
         doAnswer(i -> {
             EventMessage<?> message = i.getArgument(0);
-            handled.add(message.getIdentifier());
             if (ReplayToken.isReplay(message)) {
                 handledInRedelivery.add(message.getIdentifier());
             }
+            handled.add(message.getIdentifier());
             return null;
         }).when(mockHandler).handle(any());
 
@@ -699,9 +768,17 @@ class TrackingEventProcessorTest {
         assertWithin(1, TimeUnit.SECONDS, () -> assertEquals(8, handled.size()));
         assertEquals(handled.subList(0, 4), handled.subList(4, 8));
         assertEquals(handled.subList(4, 8), handledInRedelivery);
-        assertTrue(testSubject.processingStatus().get(0).isReplaying());
+        assertTrue(testSubject.processingStatus().get(segmentId).isReplaying());
+        assertTrue(testSubject.processingStatus().get(segmentId).getCurrentPosition().isPresent());
+        assertTrue(testSubject.processingStatus().get(segmentId).getResetPosition().isPresent());
+
+        long resetPositionAtReplay = testSubject.processingStatus().get(segmentId).getCurrentPosition().getAsLong();
         eventBus.publish(createEvents(1));
-        assertWithin(1, TimeUnit.SECONDS, () -> assertFalse(testSubject.processingStatus().get(0).isReplaying()));
+
+        assertWithin(1, TimeUnit.SECONDS, () -> assertFalse(testSubject.processingStatus().get(segmentId).isReplaying()));
+        assertWithin(1, TimeUnit.SECONDS, () -> assertFalse(testSubject.processingStatus().get(segmentId).getResetPosition().isPresent()));
+        assertWithin(1, TimeUnit.SECONDS, () -> assertTrue(testSubject.processingStatus().get(segmentId).getCurrentPosition().isPresent()));
+        assertWithin(1, TimeUnit.SECONDS, () -> assertTrue(testSubject.processingStatus().get(segmentId).getCurrentPosition().getAsLong() > resetPositionAtReplay));
     }
 
     @Test
@@ -709,14 +786,15 @@ class TrackingEventProcessorTest {
         when(mockHandler.supportsReset()).thenReturn(true);
         final List<String> handled = new CopyOnWriteArrayList<>();
         final List<String> handledInRedelivery = new CopyOnWriteArrayList<>();
+        int segmentId = 0;
 
         //noinspection Duplicates
         doAnswer(i -> {
             EventMessage<?> message = i.getArgument(0);
-            handled.add(message.getIdentifier());
             if (ReplayToken.isReplay(message)) {
                 handledInRedelivery.add(message.getIdentifier());
             }
+            handled.add(message.getIdentifier());
             return null;
         }).when(mockHandler).handle(any());
 
@@ -731,9 +809,17 @@ class TrackingEventProcessorTest {
         assertFalse(handledInRedelivery.contains(handled.get(1)));
         assertEquals(handled.subList(2, 4), handled.subList(4, 6));
         assertEquals(handled.subList(4, 6), handledInRedelivery);
-        assertTrue(testSubject.processingStatus().get(0).isReplaying());
+        assertTrue(testSubject.processingStatus().get(segmentId).isReplaying());
+        assertTrue(testSubject.processingStatus().get(segmentId).getCurrentPosition().isPresent());
+        assertTrue(testSubject.processingStatus().get(segmentId).getResetPosition().isPresent());
+
+        long resetPositionAtReplay = testSubject.processingStatus().get(segmentId).getResetPosition().getAsLong();
         eventBus.publish(createEvents(1));
-        assertWithin(1, TimeUnit.SECONDS, () -> assertFalse(testSubject.processingStatus().get(0).isReplaying()));
+
+        assertWithin(1, TimeUnit.SECONDS, () -> assertFalse(testSubject.processingStatus().get(segmentId).isReplaying()));
+        assertWithin(1, TimeUnit.SECONDS, () -> assertFalse(testSubject.processingStatus().get(segmentId).getResetPosition().isPresent()));
+        assertWithin(1, TimeUnit.SECONDS, () -> assertTrue(testSubject.processingStatus().get(segmentId).getCurrentPosition().isPresent()));
+        assertWithin(1, TimeUnit.SECONDS, () -> assertTrue(testSubject.processingStatus().get(segmentId).getCurrentPosition().getAsLong() > resetPositionAtReplay));
     }
 
     @Test
@@ -760,14 +846,15 @@ class TrackingEventProcessorTest {
         when(mockHandler.supportsReset()).thenReturn(true);
         final List<String> handled = new CopyOnWriteArrayList<>();
         final List<String> handledInRedelivery = new CopyOnWriteArrayList<>();
+        int segmentId = 0;
 
         //noinspection Duplicates
         doAnswer(i -> {
             EventMessage<?> message = i.getArgument(0);
-            handled.add(message.getIdentifier());
             if (ReplayToken.isReplay(message)) {
                 handledInRedelivery.add(message.getIdentifier());
             }
+            handled.add(message.getIdentifier());
             return null;
         }).when(mockHandler).handle(any());
 
@@ -780,9 +867,17 @@ class TrackingEventProcessorTest {
         assertWithin(1, TimeUnit.SECONDS, () -> assertEquals(4, handled.size()));
         assertEquals(handled.subList(0, 2), handled.subList(2, 4));
         assertEquals(handled.subList(2, 4), handledInRedelivery);
-        assertTrue(testSubject.processingStatus().get(0).isReplaying());
+        assertTrue(testSubject.processingStatus().get(segmentId).isReplaying());
+        assertTrue(testSubject.processingStatus().get(segmentId).getCurrentPosition().isPresent());
+        assertTrue(testSubject.processingStatus().get(segmentId).getResetPosition().isPresent());
+
+        long resetPositionAtReplay = testSubject.processingStatus().get(segmentId).getResetPosition().getAsLong();
         eventBus.publish(createEvents(1));
-        assertWithin(1, TimeUnit.SECONDS, () -> assertFalse(testSubject.processingStatus().get(0).isReplaying()));
+
+        assertWithin(1, TimeUnit.SECONDS, () -> assertFalse(testSubject.processingStatus().get(segmentId).isReplaying()));
+        assertWithin(1, TimeUnit.SECONDS, () -> assertFalse(testSubject.processingStatus().get(segmentId).getResetPosition().isPresent()));
+        assertWithin(1, TimeUnit.SECONDS, () -> assertTrue(testSubject.processingStatus().get(segmentId).getCurrentPosition().isPresent()));
+        assertWithin(1, TimeUnit.SECONDS, () -> assertTrue(testSubject.processingStatus().get(segmentId).getCurrentPosition().getAsLong() > resetPositionAtReplay));
     }
 
     @Test
@@ -790,22 +885,27 @@ class TrackingEventProcessorTest {
         when(mockHandler.supportsReset()).thenReturn(true);
         final List<String> handled = new CopyOnWriteArrayList<>();
         final List<String> handledInRedelivery = new CopyOnWriteArrayList<>();
+        int segmentId = 0;
         //noinspection Duplicates
         doAnswer(i -> {
             EventMessage<?> message = i.getArgument(0);
-            handled.add(message.getIdentifier());
             if (ReplayToken.isReplay(message)) {
                 handledInRedelivery.add(message.getIdentifier());
             }
+            handled.add(message.getIdentifier());
             return null;
         }).when(mockHandler).handle(any());
 
         testSubject.resetTokens();
+
         testSubject.start();
         eventBus.publish(createEvents(4));
         assertWithin(1, TimeUnit.SECONDS, () -> assertEquals(4, handled.size()));
         assertEquals(0, handledInRedelivery.size());
-        assertFalse(testSubject.processingStatus().get(0).isReplaying());
+        assertFalse(testSubject.processingStatus().get(segmentId).isReplaying());
+        assertFalse(testSubject.processingStatus().get(segmentId).getResetPosition().isPresent());
+        assertTrue(testSubject.processingStatus().get(segmentId).getCurrentPosition().isPresent());
+        assertTrue(testSubject.processingStatus().get(segmentId).getCurrentPosition().getAsLong() > 0);
     }
 
     @SuppressWarnings("unchecked")
@@ -904,6 +1004,7 @@ class TrackingEventProcessorTest {
     @Test
     void testUpdateActiveSegmentsWhenBatchIsEmpty() throws Exception {
         //noinspection unchecked
+        int segmentId = 0;
         StreamableMessageSource<TrackedEventMessage<?>> stubSource = mock(StreamableMessageSource.class);
         testSubject = TrackingEventProcessor.builder()
                                             .name("test")
@@ -921,7 +1022,7 @@ class TrackingEventProcessorTest {
 
         waitForStatus("Segment 0 caught up", 5, TimeUnit.SECONDS, status -> status.get(0).isCaughtUp());
 
-        EventTrackerStatus eventTrackerStatus = testSubject.processingStatus().get(0);
+        EventTrackerStatus eventTrackerStatus = testSubject.processingStatus().get(segmentId);
         GapAwareTrackingToken expectedToken = GapAwareTrackingToken.newInstance(5, asList(3L, 4L));
         TrackingToken lastToken = eventTrackerStatus.getTrackingToken();
         assertTrue(lastToken.covers(expectedToken));
@@ -964,18 +1065,29 @@ class TrackingEventProcessorTest {
         while (testSubject.processingStatus().isEmpty()) {
             Thread.sleep(10);
         }
+        int segmentId = 0;
 
-        assertTrue(testSubject.mergeSegment(0).join(), "Expected merge to succeed");
-        waitForSegmentStart(0);
+        assertTrue(testSubject.mergeSegment(segmentId).join(), "Expected merge to succeed");
+        waitForProcessingStatus(segmentId, EventTrackerStatus::isMerging);
+
+        waitForSegmentStart(segmentId);
+
         assertArrayEquals(new int[]{0}, tokenStore.fetchSegments(testSubject.getName()));
+
+        publishEvents(1);
+        waitForProcessingStatus(segmentId, s -> !s.isMerging());
     }
 
     @Test
     @Timeout(value = 10)
     void testMergeSegments_BothClaimedByProcessor() throws Exception {
-        initProcessor(TrackingEventProcessorConfiguration.forParallelProcessing(2));
+        initProcessor(TrackingEventProcessorConfiguration.forParallelProcessing(2)
+                                                         .andEventAvailabilityTimeout(10, TimeUnit.MILLISECONDS)
+                                                         .andBatchSize(100));
         tokenStore.initializeTokenSegments(testSubject.getName(), 2);
         List<EventMessage<?>> handledEvents = new CopyOnWriteArrayList<>();
+        int segmentId = 0;
+
         when(mockHandler.handle(any())).thenAnswer(i -> handledEvents.add(i.getArgument(0)));
 
         publishEvents(10);
@@ -984,21 +1096,32 @@ class TrackingEventProcessorTest {
         waitForActiveThreads(2);
 
         assertWithin(
-                50, TimeUnit.MILLISECONDS,
-                () -> assertTrue(testSubject.mergeSegment(0).join(), "Expected merge to succeed")
-        );
-        assertArrayEquals(new int[]{0}, tokenStore.fetchSegments(testSubject.getName()));
-        waitForProcessingStatus(0, EventTrackerStatus::isCaughtUp);
-
-        assertWithin(
                 5, TimeUnit.SECONDS,
                 () -> assertEquals(
                         10, handledEvents.stream().map(EventMessage::getIdentifier).distinct().count(),
-                        "Expected all 10 messages to be handled"
+                        "Expected message to be handled"
                 )
         );
-        Thread.sleep(100);
-        assertEquals(10, handledEvents.size(), "Number of handler invocations doesn't match number of unique events");
+
+        assertFalse(testSubject.processingStatus().get(segmentId).isMerging());
+        assertFalse(testSubject.processingStatus().get(segmentId).mergeCompletedPosition().isPresent());
+
+        assertWithin(
+                50, TimeUnit.MILLISECONDS,
+                () -> assertTrue(testSubject.mergeSegment(segmentId).join(), "Expected merge to succeed")
+        );
+
+        EventTrackerStatus status = waitForProcessingStatus(segmentId, EventTrackerStatus::isMerging);
+        assertTrue(status.mergeCompletedPosition().isPresent());
+        long mergeCompletedPosition = status.mergeCompletedPosition().getAsLong();
+
+        assertArrayEquals(new int[]{0}, tokenStore.fetchSegments(testSubject.getName()));
+
+        publishEvents(1);
+        status = waitForProcessingStatus(segmentId, s -> !s.isMerging());
+        assertFalse(status.mergeCompletedPosition().isPresent());
+        assertTrue(status.getCurrentPosition().isPresent());
+        assertTrue(status.getCurrentPosition().getAsLong() > mergeCompletedPosition);
     }
 
     @Test
@@ -1008,6 +1131,7 @@ class TrackingEventProcessorTest {
         tokenStore.initializeTokenSegments(testSubject.getName(), 2);
         List<EventMessage<?>> handledEvents = new CopyOnWriteArrayList<>();
         List<EventMessage<?>> events = new ArrayList<>();
+        int segmentId = 0;
         for (int i = 0; i < 10; i++) {
             events.add(createEvent(UUID.randomUUID().toString(), 0));
         }
@@ -1021,12 +1145,12 @@ class TrackingEventProcessorTest {
 
         assertWithin(
                 50, TimeUnit.MILLISECONDS,
-                () -> assertTrue(testSubject.mergeSegment(0).join(), "Expected merge to succeed")
+                () -> assertTrue(testSubject.mergeSegment(segmentId).join(), "Expected merge to succeed")
         );
         assertArrayEquals(new int[]{0}, tokenStore.fetchSegments(testSubject.getName()));
-        waitForSegmentStart(0);
+        waitForSegmentStart(segmentId);
 
-        while (!Optional.ofNullable(testSubject.processingStatus().get(0))
+        while (!Optional.ofNullable(testSubject.processingStatus().get(segmentId))
                         .map(EventTrackerStatus::isCaughtUp)
                         .orElse(false)) {
             Thread.sleep(10);
@@ -1040,6 +1164,7 @@ class TrackingEventProcessorTest {
     void testDoubleSplitAndMerge() throws Exception {
         tokenStore.initializeTokenSegments(testSubject.getName(), 1);
         List<EventMessage<?>> handledEvents = new CopyOnWriteArrayList<>();
+        int segmentId = 0;
         when(mockHandler.handle(any())).thenAnswer(i -> handledEvents.add(i.getArgument(0)));
 
         publishEvents(10);
@@ -1049,13 +1174,13 @@ class TrackingEventProcessorTest {
 
         assertWithin(
                 50, TimeUnit.MILLISECONDS,
-                () -> assertTrue(testSubject.splitSegment(0).join(), "Expected split to succeed")
+                () -> assertTrue(testSubject.splitSegment(segmentId).join(), "Expected split to succeed")
         );
         waitForActiveThreads(1);
 
         assertWithin(
                 50, TimeUnit.MILLISECONDS,
-                () -> assertTrue(testSubject.splitSegment(0).join(), "Expected split to succeed")
+                () -> assertTrue(testSubject.splitSegment(segmentId).join(), "Expected split to succeed")
         );
         waitForActiveThreads(1);
 
@@ -1063,17 +1188,19 @@ class TrackingEventProcessorTest {
 
         publishEvents(20);
 
-        waitForProcessingStatus(0, EventTrackerStatus::isCaughtUp);
+        waitForProcessingStatus(segmentId, EventTrackerStatus::isCaughtUp);
 
-        assertTrue(testSubject.mergeSegment(0).join(), "Expected merge to succeed");
+        assertFalse(testSubject.processingStatus().get(segmentId).isMerging());
+
+        assertTrue(testSubject.mergeSegment(segmentId).join(), "Expected merge to succeed");
         assertArrayEquals(new int[]{0, 1}, tokenStore.fetchSegments(testSubject.getName()));
 
         publishEvents(10);
 
-        waitForSegmentStart(0);
-        waitForProcessingStatus(0, est -> est.getSegment().getMask() == 1 && est.isCaughtUp());
+        waitForSegmentStart(segmentId);
+        waitForProcessingStatus(segmentId, est -> est.getSegment().getMask() == 1 && est.isCaughtUp());
 
-        assertTrue(testSubject.mergeSegment(0).join(), "Expected merge to succeed");
+        assertTrue(testSubject.mergeSegment(segmentId).join(), "Expected merge to succeed");
         assertArrayEquals(new int[]{0}, tokenStore.fetchSegments(testSubject.getName()));
 
         assertWithin(3, TimeUnit.SECONDS, () -> assertEquals(40, handledEvents.size()));
@@ -1085,6 +1212,7 @@ class TrackingEventProcessorTest {
         EventMessageHandler otherHandler = mock(EventMessageHandler.class);
         when(otherHandler.canHandle(any())).thenReturn(true);
         when(otherHandler.supportsReset()).thenReturn(true);
+        int segmentId = 0;
         EventHandlerInvoker mockInvoker = SimpleEventHandlerInvoker.builder()
                                                                    .eventHandlers(singleton(otherHandler))
                                                                    .sequencingPolicy(m -> 0)
@@ -1117,7 +1245,7 @@ class TrackingEventProcessorTest {
 
         publishEvents(10);
 
-        testSubject.mergeSegment(0);
+        testSubject.mergeSegment(segmentId);
 
         publishEvents(10);
 
@@ -1139,6 +1267,7 @@ class TrackingEventProcessorTest {
         tokenStore.initializeTokenSegments(testSubject.getName(), 2);
         List<EventMessage<?>> handledEvents = new CopyOnWriteArrayList<>();
         List<EventMessage<?>> replayedEvents = new CopyOnWriteArrayList<>();
+        int segmentId = 0;
         when(mockHandler.handle(any())).thenAnswer(i -> {
             TrackedEventMessage<?> message = i.getArgument(0);
             if (ReplayToken.isReplay(message)) {
@@ -1165,13 +1294,13 @@ class TrackingEventProcessorTest {
         waitForActiveThreads(1);
         Thread.yield();
 
-        CompletableFuture<Boolean> mergeResult = testSubject.mergeSegment(0);
+        CompletableFuture<Boolean> mergeResult = testSubject.mergeSegment(segmentId);
 
         publishEvents(20);
 
         assertTrue(mergeResult.join(), "Expected merge to succeed");
         assertArrayEquals(new int[]{0}, tokenStore.fetchSegments(testSubject.getName()));
-        waitForSegmentStart(0);
+        waitForSegmentStart(segmentId);
 
         assertWithin(10, TimeUnit.SECONDS, () -> assertEquals(30, handledEvents.size()));
         Thread.sleep(100);
@@ -1190,6 +1319,7 @@ class TrackingEventProcessorTest {
         tokenStore.initializeTokenSegments(testSubject.getName(), 2);
         List<EventMessage<?>> handledEvents = new CopyOnWriteArrayList<>();
         List<EventMessage<?>> events = new ArrayList<>();
+        int segmentId = 0;
         for (int i = 0; i < 10; i++) {
             events.add(createEvent(UUID.randomUUID().toString(), 0));
         }
@@ -1216,7 +1346,7 @@ class TrackingEventProcessorTest {
 
         publishEvents(10);
 
-        CompletableFuture<Boolean> mergeResult = testSubject.mergeSegment(0);
+        CompletableFuture<Boolean> mergeResult = testSubject.mergeSegment(segmentId);
         assertTrue(mergeResult.join(), "Expected split to succeed");
 
         waitForActiveThreads(1);
@@ -1230,16 +1360,15 @@ class TrackingEventProcessorTest {
         waitForActiveThreads(1);
 
         assertArrayEquals(new int[]{0}, tokenStore.fetchSegments(testSubject.getName()));
-        waitForSegmentStart(0);
+        waitForSegmentStart(segmentId);
 
-        while (!testSubject.processingStatus().get(0).isCaughtUp()) {
+        while (!testSubject.processingStatus().get(segmentId).isCaughtUp()) {
             Thread.sleep(10);
         }
 
         // Replayed messages aren't counted
         assertEquals(30, handledEvents.size());
     }
-
 
     @Test
     @Timeout(value = 10)
@@ -1256,6 +1385,8 @@ class TrackingEventProcessorTest {
         testSubject.releaseSegment(0);
         testSubject.releaseSegment(2);
 
+        testSubject.processingStatus().values().forEach(status -> assertFalse(status::isMerging));
+
         while (testSubject.processingStatus().size() > 1) {
             Thread.sleep(10);
         }
@@ -1270,13 +1401,15 @@ class TrackingEventProcessorTest {
     void testMergeWithSingleSegmentRejected() throws InterruptedException {
         int numberOfSegments = 1;
         initProcessor(TrackingEventProcessorConfiguration.forParallelProcessing(numberOfSegments));
+        int segmentId = 0;
 
         testSubject.start();
         waitForActiveThreads(1);
 
-        CompletableFuture<Boolean> actual = testSubject.mergeSegment(0);
+        CompletableFuture<Boolean> actual = testSubject.mergeSegment(segmentId);
 
         assertFalse(actual.join(), "Expected merge to be rejected");
+        assertFalse(testSubject.processingStatus().get(segmentId).isMerging());
     }
 
     /**
@@ -1345,13 +1478,16 @@ class TrackingEventProcessorTest {
     }
 
     @SuppressWarnings("SameParameterValue")
-    private void waitForProcessingStatus(int segmentId,
-                                         Predicate<EventTrackerStatus> expectedStatus) throws InterruptedException {
-        while (!Optional.ofNullable(testSubject.processingStatus().get(segmentId))
+    private EventTrackerStatus waitForProcessingStatus(int segmentId,
+                                                       Predicate<EventTrackerStatus> expectedStatus) throws InterruptedException {
+        EventTrackerStatus status = testSubject.processingStatus().get(segmentId);
+        while (!Optional.ofNullable(status)
                         .map(expectedStatus::test)
                         .orElse(false)) {
-            Thread.sleep(10);
+            Thread.sleep(1);
+            status = testSubject.processingStatus().get(segmentId);
         }
+        return status;
     }
 
     private void publishEvents(int nrOfEvents) {

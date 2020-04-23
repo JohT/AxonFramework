@@ -21,9 +21,13 @@ import org.axonframework.common.AxonConfigurationException;
 import org.axonframework.common.AxonNonTransientException;
 import org.axonframework.common.ExceptionUtils;
 import org.axonframework.common.stream.BlockingStream;
+import org.axonframework.common.transaction.NoTransactionManager;
 import org.axonframework.common.transaction.TransactionManager;
 import org.axonframework.eventhandling.tokenstore.TokenStore;
 import org.axonframework.eventhandling.tokenstore.UnableToClaimTokenException;
+import org.axonframework.lifecycle.Phase;
+import org.axonframework.lifecycle.ShutdownHandler;
+import org.axonframework.lifecycle.StartHandler;
 import org.axonframework.messaging.StreamableMessageSource;
 import org.axonframework.messaging.unitofwork.BatchingUnitOfWork;
 import org.axonframework.messaging.unitofwork.RollbackConfiguration;
@@ -42,6 +46,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.CompletableFuture;
@@ -185,8 +190,12 @@ public class TrackingEventProcessor extends AbstractEventProcessor {
      * Start this processor. The processor will open an event stream on its message source in a new thread using {@link
      * StreamableMessageSource#openStream(TrackingToken)}. The {@link TrackingToken} used to open the stream will be
      * fetched from the {@link TokenStore}.
+     * <p>
+     * Upon start up of an application, this method will be invoked in the {@link Phase#INBOUND_EVENT_CONNECTORS}
+     * phase.
      */
     @Override
+    @StartHandler(phase = Phase.INBOUND_EVENT_CONNECTORS)
     public void start() {
         State previousState = state.getAndSet(State.STARTED);
         if (!previousState.isRunning()) {
@@ -649,6 +658,17 @@ public class TrackingEventProcessor extends AbstractEventProcessor {
         awaitTermination();
     }
 
+    /**
+     * {@inheritDoc}
+     * <p>
+     * Will be shutdown on the {@link Phase#INBOUND_EVENT_CONNECTORS} phase.
+     */
+    @Override
+    @ShutdownHandler(phase = Phase.INBOUND_EVENT_CONNECTORS)
+    public CompletableFuture<Void> shutdownAsync() {
+        return super.shutdownAsync();
+    }
+
     private void setShutdownState() {
         if (state.getAndSet(State.SHUT_DOWN).isRunning()) {
             logger.info("Shutdown state set for Processor '{}'.", getName());
@@ -667,16 +687,6 @@ public class TrackingEventProcessor extends AbstractEventProcessor {
                 Thread.currentThread().interrupt();
             }
         }
-    }
-
-    /**
-     * Begins shutting down. Does not block until shutdown is complete. Calling {@link #shutDown()} after this method
-     * will block until the shutdown is complete.
-     */
-    @Override
-    public CompletableFuture<Void> shutdownAsync() {
-        setShutdownState();
-        return CompletableFuture.runAsync(this::awaitTermination);
     }
 
     /**
@@ -850,6 +860,16 @@ public class TrackingEventProcessor extends AbstractEventProcessor {
         }
 
         @Override
+        public boolean isMerging() {
+            return MergedTrackingToken.isMergeInProgress(trackingToken);
+        }
+
+        @Override
+        public OptionalLong mergeCompletedPosition() {
+            return MergedTrackingToken.mergePosition(trackingToken);
+        }
+
+        @Override
         public TrackingToken getTrackingToken() {
             return WrappedToken.unwrapLowerBound(trackingToken);
         }
@@ -862,6 +882,31 @@ public class TrackingEventProcessor extends AbstractEventProcessor {
         @Override
         public Throwable getError() {
             return errorState;
+        }
+
+        /**
+         * {@inheritDoc}
+         */
+        @Override
+        public OptionalLong getCurrentPosition() {
+            if (isReplaying()) {
+                return  WrappedToken.unwrap(trackingToken, ReplayToken.class)
+                                    .map(ReplayToken::position)
+                                    .orElse(OptionalLong.empty());
+            }
+
+            if (isMerging()) {
+                return  WrappedToken.unwrap(trackingToken, MergedTrackingToken.class)
+                                    .map(MergedTrackingToken::position)
+                                    .orElse(OptionalLong.empty());
+            }
+
+            return (trackingToken == null) ? OptionalLong.empty() : trackingToken.position();
+        }
+
+        @Override
+        public OptionalLong getResetPosition() {
+            return ReplayToken.getTokenAtReset(trackingToken);
         }
 
         private TrackingToken getInternalTrackingToken() {
@@ -919,7 +964,7 @@ public class TrackingEventProcessor extends AbstractEventProcessor {
         private TransactionManager transactionManager;
         private TrackingEventProcessorConfiguration trackingEventProcessorConfiguration =
                 TrackingEventProcessorConfiguration.forSingleThreadedProcessing();
-        private boolean storeTokenBeforeProcessing = true;
+        private Boolean storeTokenBeforeProcessing;
 
         public Builder() {
             super.rollbackConfiguration(RollbackConfigurationType.ANY_THROWABLE);
@@ -988,13 +1033,30 @@ public class TrackingEventProcessor extends AbstractEventProcessor {
 
         /**
          * Sets the {@link TransactionManager} used when processing {@link EventMessage}s.
+         * <p/>
+         * Note that setting this value influences the behavior for storing tokens either at the start or at the end of
+         * a batch.
+         * If a TransactionManager other than a {@link NoTransactionManager} is configured, the default behavior is to
+         * store the last token of the Batch to the Token Store before processing of events begins. If the
+         * {@link NoTransactionManager} is provided, the default is to extend the claim at the start of the unit of
+         * work, and update the token after processing Events.
+         * When tokens are stored at the start of a batch, a claim extension will be sent at the end of the batch if
+         * processing that batch took longer than the {@link
+         * TrackingEventProcessorConfiguration#andEventAvailabilityTimeout(long, TimeUnit) tokenClaimUpdateInterval}.
+         * <p>
+         * Use {@link #storingTokensAfterProcessing()} to force storage of tokens at the end of a batch.
          *
          * @param transactionManager the {@link TransactionManager} used when processing {@link EventMessage}s
+         *
          * @return the current Builder instance, for fluent interfacing
+         * @see #storingTokensAfterProcessing()
          */
         public Builder transactionManager(TransactionManager transactionManager) {
             assertNonNull(transactionManager, "TransactionManager may not be null");
             this.transactionManager = transactionManager;
+            if (storeTokenBeforeProcessing == null) {
+                storeTokenBeforeProcessing = transactionManager != NoTransactionManager.instance();
+            }
             return this;
         }
 
@@ -1024,7 +1086,10 @@ public class TrackingEventProcessor extends AbstractEventProcessor {
          * are desired.
          * <p>
          * The default behavior is to store the last token of the Batch to the Token Store before processing of events
-         * begins. A Token Claim extension is only sent when processing of the batch took longer than the {@link
+         * begins, if a TransactionManager is configured. If the {@link NoTransactionManager} is provided, the default
+         * is to extend the claim at the start of the unit of work, and update the token after processing Events.
+         * When tokens are stored at the start of a batch, a claim extension will be sent at the end of the batch if
+         * processing that batch took longer than the {@link
          * TrackingEventProcessorConfiguration#andEventAvailabilityTimeout(long, TimeUnit) tokenClaimUpdateInterval}.
          *
          * @return the current Builder instance, for fluent interfacing
@@ -1052,6 +1117,9 @@ public class TrackingEventProcessor extends AbstractEventProcessor {
         @Override
         protected void validate() throws AxonConfigurationException {
             super.validate();
+            if (storeTokenBeforeProcessing == null) {
+                storeTokenBeforeProcessing = false;
+            }
             assertNonNull(messageSource, "The StreamableMessageSource is a hard requirement and should be provided");
             assertNonNull(tokenStore, "The TokenStore is a hard requirement and should be provided");
             assertNonNull(transactionManager, "The TransactionManager is a hard requirement and should be provided");
@@ -1139,6 +1207,7 @@ public class TrackingEventProcessor extends AbstractEventProcessor {
                 } catch (Exception e) {
                     logger.warn("Fetch Segments for Processor '{}' failed: {}. Preparing for retry in {}s",
                                 processorName, e.getMessage(), waitTime);
+                    logger.debug("Fetch Segments failed because:", e);
                     doSleepFor(SECONDS.toMillis(waitTime));
                     waitTime = Math.min(waitTime * 2, 60);
 
